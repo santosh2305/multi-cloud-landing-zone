@@ -1,0 +1,41 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Variable files with secrets — never commit these
+*.tfvars
+!*.tfvars.example
+backend.hcl
+
+# AWS credentials
+.aws/
+
+# Azure credentials
+.azure/
+
+# Environment files
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scripts output
+scripts/*.log

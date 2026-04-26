@@ -1,0 +1,23 @@
+# environments/prod/prod.tfvars.example
+#
+# Copy this to prod.tfvars and fill in real values.
+# prod.tfvars is gitignored and must NEVER be committed.
+
+cost_centre = "CC-1234"
+
+aws_organization_arn    = "arn:aws:organizations::123456789012:organization/o-xxxxxxxxxxxx"
+security_account_id     = "234567890123"
+log_archive_bucket_name = "company-energy-log-archive-prod"
+
+connectivity_subscription_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+log_analytics_workspace_id   = "/subscriptions/xxxx/resourceGroups/rg-mgmt/providers/Microsoft.OperationalInsights/workspaces/law-mgmt-prod"
+
+# These come from the AWS TGW VPN attachment outputs after networking module is applied
+aws_tgw_vpn_ip_1 = "1.2.3.4"
+aws_tgw_vpn_ip_2 = "5.6.7.8"
+aws_tgw_bgp_ip_1 = "169.254.10.1"
+aws_tgw_bgp_ip_2 = "169.254.11.1"
+
+# Store the real value in Azure Key Vault / AWS Secrets Manager
+# Pass at plan/apply time via: TF_VAR_vpn_shared_key=$(az keyvault secret show ...)
+vpn_shared_key = "REPLACE_WITH_VALUE_FROM_KEY_VAULT"

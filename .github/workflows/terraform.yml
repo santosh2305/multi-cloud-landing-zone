@@ -1,0 +1,250 @@
+name: Terraform Plan & Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'modules/**'
+      - 'environments/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'modules/**'
+      - 'environments/**'
+
+permissions:
+  id-token: write   # Required for OIDC token exchange with AWS and Azure
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.7.0"
+  AWS_REGION: "eu-west-1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate — runs on all PRs and pushes
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: .
+
+      - name: Validate AWS modules
+        run: |
+          for module in modules/aws/*/; do
+            echo "Validating $module"
+            terraform -chdir="$module" init -backend=false
+            terraform -chdir="$module" validate
+          done
+
+      - name: Validate Azure modules
+        run: |
+          for module in modules/azure/*/; do
+            echo "Validating $module"
+            terraform -chdir="$module" init -backend=false
+            terraform -chdir="$module" validate
+          done
+
+  # ---------------------------------------------------------------------------
+  # Security scan — tfsec on all Terraform
+  # ---------------------------------------------------------------------------
+  security-scan:
+    name: Security Scan (tfsec)
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: false
+          format: sarif
+          additional_args: --minimum-severity HIGH
+
+  # ---------------------------------------------------------------------------
+  # Plan — runs on PRs, posts result as comment
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform Plan — ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    if: github.event_name == 'pull_request'
+
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+
+    environment: ${{ matrix.environment }}-plan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # AWS OIDC auth — no long-lived access keys (see ADR-002)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Azure OIDC auth
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init -reconfigure
+        working-directory: environments/${{ matrix.environment }}
+        env:
+          TF_BACKEND_S3_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_BACKEND_DYNAMODB_TABLE: ${{ vars.TF_LOCK_TABLE }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="${{ matrix.environment }}.tfvars" \
+            -out=tfplan \
+            -no-color \
+            2>&1 | tee plan-output.txt
+        working-directory: environments/${{ matrix.environment }}
+        env:
+          TF_VAR_vpn_shared_key: ${{ secrets.VPN_SHARED_KEY }}
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('environments/${{ matrix.environment }}/plan-output.txt', 'utf8');
+            const truncated = planOutput.length > 65000
+              ? planOutput.substring(0, 65000) + '\n\n... truncated. See job logs for full output.'
+              : planOutput;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan — \`${{ matrix.environment }}\`\n\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+  # ---------------------------------------------------------------------------
+  # Apply — only on merge to main, prod requires manual approval
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Terraform Apply — ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    strategy:
+      matrix:
+        environment: [dev, staging]
+      # prod is handled separately below with manual approval gate
+
+    environment: ${{ matrix.environment }}-apply
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init -reconfigure
+        working-directory: environments/${{ matrix.environment }}
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -var-file="${{ matrix.environment }}.tfvars" \
+            -auto-approve
+        working-directory: environments/${{ matrix.environment }}
+        env:
+          TF_VAR_vpn_shared_key: ${{ secrets.VPN_SHARED_KEY }}
+
+  apply-prod:
+    name: Terraform Apply — prod
+    runs-on: ubuntu-latest
+    needs: apply
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment: prod-apply  # Requires manual approval in GitHub Environments settings
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PROD_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init -reconfigure
+        working-directory: environments/prod
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -var-file="prod.tfvars" \
+            -auto-approve
+        working-directory: environments/prod
+        env:
+          TF_VAR_vpn_shared_key: ${{ secrets.PROD_VPN_SHARED_KEY }}
